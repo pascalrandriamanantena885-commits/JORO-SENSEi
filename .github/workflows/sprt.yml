@@ -1,0 +1,205 @@
+name: SPRT (vaovao vs taloha) - matrix + safidy maro
+on:
+  workflow_dispatch:
+    inputs:
+      base_tgz:
+        description: "Taloha: foana = tgz farany ihany (mety rehefa safidy no hafa); 'prev' = faharoa farany; na anaran'ny .tgz"
+        required: false
+        default: "prev"
+      opts_base:
+        description: "Safidy UCI an'ny taloha (ohatra HashBits=19)"
+        required: false
+        default: ""
+      variants:
+        description: "Lisitra JSON: safidy UCI an'ny vaovao isaky ny SPRT. Ohatra [\"ProbCut=1\",\"CaptHist=1\",\"ContHist=1\"]. [\"\"] = tsy misy safidy"
+        default: '[""]'
+      shards:
+        description: "Job miaraka isaky ny variant (JSON), ohatra [0,1,2,3]"
+        default: "[0,1,2,3]"
+      games:
+        description: "Lalao isaky ny job"
+        default: "300"
+      movetime:
+        description: "ms isaky ny hetsika"
+        default: "100"
+      elo0:
+        description: "H0 (Elo)"
+        default: "0"
+      elo1:
+        description: "H1 (Elo)"
+        default: "10"
+      alpha_beta:
+        description: "alpha = beta (0.05 henjana, 0.1 haingana)"
+        default: "0.05"
+      start_game:
+        description: "Hitohy: laharana lalao voalohany (jereo 'Hitohy' amin'ny summary teo aloha)"
+        default: "0"
+      prior:
+        description: "Hitohy: W,D,L teo aloha. Ampiasaina rehefa variant IRAY ihany"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  perft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract new
+        run: |
+          NEW=$(ls project*.tgz 2>/dev/null | sort -V | tail -1)
+          [ -n "$NEW" ] || { echo "::error::Tsy hita ny project*.tgz"; exit 1; }
+          mkdir new && tar xzf "$NEW" --strip-components=1 --strip-components=1 -C new
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Perft gate (mijanona raha diso ny movegen)
+        run: |
+          set -e
+          mkdir cls_new
+          javac -d cls_new new/src/*.java new/tools/Perft.java
+          java -cp cls_new mg.chess.offline.own.Perft | tee perft.txt
+          { echo '### Perft (vaovao)'; echo '```'; grep PERFT_SUMMARY perft.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  sprt:
+    needs: perft
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.variants) }}
+        shard: ${{ fromJSON(inputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Anarana (fanadiovana)
+        id: n
+        env:
+          V: ${{ matrix.variant }}
+        run: |
+          N=$(printf '%s' "$V" | tr -c 'A-Za-z0-9' '_')
+          [ -n "$N" ] || N=base
+          echo "name=$N" >> "$GITHUB_OUTPUT"
+
+      - name: Extract base + new
+        env:
+          BASE_IN: ${{ github.event.inputs.base_tgz }}
+          OPTS_B: ${{ github.event.inputs.opts_base }}
+          OPTS_N: ${{ matrix.variant }}
+        run: |
+          set -e
+          LIST=$(ls project*.tgz 2>/dev/null | sort -V)
+          NEW=$(echo "$LIST" | tail -1)
+          if [ -z "$NEW" ]; then echo "::error::Tsy hita ny project*.tgz"; ls -la; exit 1; fi
+          if [ -z "$BASE_IN" ]; then BASE="$NEW"
+          elif [ "$BASE_IN" = "prev" ]; then BASE=$(echo "$LIST" | tail -2 | head -1)
+          else BASE="$BASE_IN"; fi
+          if [ "$NEW" = "$BASE" ] && [ -z "$OPTS_B$OPTS_N" ]; then
+            echo "::error::Mitovy ny tgz roa ary tsy misy safidy samy hafa"; ls -la; exit 1
+          fi
+          echo "BASE=$BASE  NEW=$NEW  opts_base=[$OPTS_B] opts_new=[$OPTS_N]"
+          mkdir base new
+          tar xzf "$BASE" --strip-components=1 -C base
+          tar xzf "$NEW" --strip-components=1 --strip-components=1 -C new
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+
+      - name: Install python-chess
+        run: pip install chess
+
+      - name: Compile base + new
+        run: |
+          set -e
+          mkdir cls_base cls_new
+          javac -d cls_base base/src/*.java base/tools/OwnUci.java
+          javac -d cls_new  new/src/*.java  new/tools/OwnUci.java
+
+      - name: SPRT shard ${{ matrix.shard }} (${{ steps.n.outputs.name }})
+        env:
+          GAMES: ${{ github.event.inputs.games }}
+          START: ${{ github.event.inputs.start_game }}
+          OPTS_B: ${{ github.event.inputs.opts_base }}
+          OPTS_N: ${{ matrix.variant }}
+          NAME: ${{ steps.n.outputs.name }}
+          SHARD: ${{ matrix.shard }}
+          MT: ${{ github.event.inputs.movetime }}
+        run: |
+          FIRST=$(( START + SHARD * GAMES ))
+          python3 new/tools/sprt.py cls_base cls_new \
+            --first-game "$FIRST" --games "$GAMES" \
+            --movetime "$MT" \
+            --opts-base "$OPTS_B" \
+            --opts-new "$OPTS_N" \
+            --workers 2 --out "sprt-$NAME-$SHARD.json" --dump "games-$NAME-$SHARD.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sprt-${{ steps.n.outputs.name }}-${{ matrix.shard }}
+          path: |
+            sprt-${{ steps.n.outputs.name }}-${{ matrix.shard }}.json
+            games-${{ steps.n.outputs.name }}-${{ matrix.shard }}.txt
+
+  summary:
+    needs: sprt
+    if: always() && needs.sprt.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.variants) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Anarana (fanadiovana)
+        id: n
+        env:
+          V: ${{ matrix.variant }}
+        run: |
+          N=$(printf '%s' "$V" | tr -c 'A-Za-z0-9' '_')
+          [ -n "$N" ] || N=base
+          echo "name=$N" >> "$GITHUB_OUTPUT"
+      - name: Extract new
+        run: |
+          NEW=$(ls project*.tgz | sort -V | tail -1)
+          mkdir new && tar xzf "$NEW" --strip-components=1 --strip-components=1 -C new
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sprt-${{ steps.n.outputs.name }}-*
+          path: results
+          merge-multiple: true
+      - name: Fitambarana LLR
+        env:
+          LABEL: ${{ matrix.variant }}
+          PRIOR: ${{ github.event.inputs.prior }}
+        run: |
+          python3 new/tools/sprt.py --aggregate results \
+            --elo0 "${{ github.event.inputs.elo0 }}" --elo1 "${{ github.event.inputs.elo1 }}" \
+            --alpha "${{ github.event.inputs.alpha_beta }}" --beta "${{ github.event.inputs.alpha_beta }}" \
+            --label "[$LABEL]" --prior "$PRIOR"
+
+  collect:
+    needs: sprt
+    if: always() && needs.sprt.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sprt-*
+          path: all
+          merge-multiple: true
+      - name: Fanangonana toerana ho an'ny Texel
+        run: |
+          ls all | head -50
+          cat all/games-*.txt | gzip > texel-positions.txt.gz
+          N=$(zcat texel-positions.txt.gz | wc -l)
+          echo "### Texel data: $N toerana milamina" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: texel-data
+          path: texel-positions.txt.gz
+          retention-days: 30
