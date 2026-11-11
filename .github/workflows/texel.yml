@@ -1,0 +1,148 @@
+name: Texel (mamoaka data + tuning an'ny Eval)
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "Job miaraka amin'ny fanaovana data (JSON)"
+        default: "[0,1,2,3,4,5,6,7]"
+      games:
+        description: "Lalao isaky ny job (~0.4 s/lalao/core amin'ny depth 6; 12000 lalao x 8 job ~ 4M toerana, ~40 min/job)"
+        default: "12000"
+      depth:
+        description: "Depth ny lalao self-play"
+        default: "6"
+      movetime:
+        description: "ms ambony indrindra isaky ny hetsika"
+        default: "100"
+      groups:
+        description: "Parameter hotombanana: val,pass,w,w2,w3,w4,pst (pst = ~770 parameter, mila data >= 3M toerana; w2/w3/w4 mampandeha ny Eval2/3/4 mandritra ny tuning)"
+        default: "val,pass,w,w3,w4"
+      maxpos:
+        description: "Fetra isan'ny toerana ampiasaina ao amin'ny tuning (0 = rehetra)"
+        default: "0"
+      prev_run_id:
+        description: "Safidy: laharana run Texel taloha (ao amin'ny URL: .../actions/runs/<ID>) mba hampiasana indray ny artifact texel-gen-* (tsy mila download/commit)"
+        required: false
+        default: ""
+      jvm_extra:
+        description: "Safidy JVM fanampiny, ohatra -Deval4=true (mampandeha Eval4 mandritra ny tuning 'pst')"
+        required: false
+        default: ""
+      passes:
+        description: "Isan'ny pass ambony indrindra"
+        default: "8"
+      minutes:
+        description: "Fetra fotoana ho an'ny tuning (min)"
+        default: "240"
+      first_game:
+        description: "Laharana lalao voalohany (ovay raha tsy te hamerina ny data teo aloha)"
+        default: "0"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract project
+        run: |
+          NEW=$(ls project*.tgz 2>/dev/null | sort -V | tail -1)
+          [ -n "$NEW" ] || { echo "::error::Tsy hita ny project*.tgz"; exit 1; }
+          echo "Mampiasa $NEW"; tar xzf "$NEW" --strip-components=1
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Compile
+        run: rm -rf cls && mkdir cls && javac -d cls src/*.java tools/SelfPlay.java
+      - name: Self-play shard ${{ matrix.shard }}
+        env:
+          GAMES: ${{ github.event.inputs.games }}
+          DEPTH: ${{ github.event.inputs.depth }}
+          MT: ${{ github.event.inputs.movetime }}
+          FIRST: ${{ github.event.inputs.first_game }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          START=$(( FIRST + SHARD * GAMES ))
+          java -Xmx2g -cp cls mg.chess.offline.own.SelfPlay "$START" "$GAMES" "$DEPTH" "$MT" "games-$SHARD.txt" "$(nproc)" 8 | tail -3
+          gzip -f "games-$SHARD.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: texel-gen-${{ matrix.shard }}
+          path: games-${{ matrix.shard }}.txt.gz
+          retention-days: 7
+
+  tune:
+    needs: gen
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract project
+        run: |
+          NEW=$(ls project*.tgz 2>/dev/null | sort -V | tail -1)
+          [ -n "$NEW" ] || { echo "::error::Tsy hita ny project*.tgz"; exit 1; }
+          tar xzf "$NEW" --strip-components=1
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: texel-gen-*
+          path: data
+          merge-multiple: true
+      - name: Data taloha (artifact texel-gen-* avy amin'ny run teo aloha)
+        if: ${{ github.event.inputs.prev_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: texel-gen-*
+          run-id: ${{ github.event.inputs.prev_run_id }}
+          github-token: ${{ github.token }}
+          path: data_old
+      - name: Compile
+        run: rm -rf cls && mkdir cls && javac -d cls src/*.java tools/Texel.java
+      - name: Tuning
+        env:
+          GROUPS_IN: ${{ github.event.inputs.groups }}
+          PASSES: ${{ github.event.inputs.passes }}
+          MINUTES: ${{ github.event.inputs.minutes }}
+          MAXPOS: ${{ github.event.inputs.maxpos }}
+          JVM_EXTRA: ${{ github.event.inputs.jvm_extra }}
+        run: |
+          EXTRA=$(ls texel-extra*.gz 2>/dev/null || true)
+          OLD=$(ls data_old/*/*.gz 2>/dev/null || true)
+          echo "extra=[$EXTRA] old=[$(echo $OLD | wc -w) rakitra]"
+          ls -la data
+          java -Xmx6g -Dgroups="$GROUPS_IN" -Dpasses="$PASSES" -Dminutes="$MINUTES" -Dmaxpos="$MAXPOS" $JVM_EXTRA \
+            -cp cls mg.chess.offline.own.Texel tuned.txt data/*.gz $EXTRA $OLD | tee texel.log
+          { echo '### Texel'; echo '```'; grep -E "DATA|^K=|PARAMS|PASS|FINAL" texel.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Apply + compile + perft
+        run: |
+          cp src/Eval.java Eval.java
+          python3 tools/apply_tuned.py tuned.txt Eval.java
+          mkdir -p chk
+          cp src/*.java chk/mg/chess/offline/own/
+          cp Eval.java chk/Eval.java
+          rm -rf cls2 && mkdir cls2 && javac -d cls2 chk/*.java tools/Perft.java
+          java -cp cls2 mg.chess.offline.own.Perft | grep PERFT_SUMMARY
+      - name: Mamoaka tgz vaovao (Eval voatombana)
+        run: |
+          NEW=$(ls project*.tgz | sort -V | tail -1)
+          mkdir proj && tar xzf "$NEW" --strip-components=1 -C proj
+          cp Eval.java proj/src/Eval.java
+          echo "- Texel tuning (groups=${{ github.event.inputs.groups }}) avy amin'ny $NEW" >> proj/docs/OWN_ENGINE.md
+          (cd proj && tar czf ../texel-tuned-project.tgz .)
+          ls -la texel-tuned-project.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: texel-tuned
+          path: |
+            tuned.txt
+            Eval.java
+            texel.log
+            texel-tuned-project.tgz
