@@ -68,7 +68,7 @@ jobs:
           {
             echo '### JORO SPRT configuration'
             echo "- Mode: **$MODE**"
-            echo "- Base: \\`$BASE\\`"
+            echo "- Base: \`$BASE\`"
             echo "- Maximum games: **$GAMES**"
             echo "- Movetime: **$MOVETIME ms per move**"
             echo '- Hypotheses: H0 = 0 Elo; H1 = +5 Elo; alpha = beta = 0.05'
@@ -88,8 +88,13 @@ jobs:
           fi
           HEAD_SHA=$(git rev-parse HEAD)
           if [[ "$BASE_SHA" == "$HEAD_SHA" ]]; then
-            echo '::error::Mitovy amin’ny candidate ny base. Misafidiana base taloha (ohatra main).' 
-            exit 1
+            if git rev-parse --verify 'HEAD~1^{commit}' >/dev/null 2>&1; then
+              echo '::warning::Mitovy ny base sy candidate, ka ampiasaina ny HEAD~1 ho base.'
+              BASE_SHA=$(git rev-parse 'HEAD~1^{commit}')
+            else
+              echo '::error::Mitovy ny base sy candidate ary tsy misy commit taloha.'
+              exit 1
+            fi
           fi
           git worktree add --detach "$RUNNER_TEMP/joro-base" "$BASE_SHA"
           echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
@@ -169,9 +174,9 @@ jobs:
         run: |
           {
             echo '### JORO HCE SPRT report'
-            echo "- Base commit: \\`$BASE_SHA\\`"
-            echo "- Candidate commit: \\`$HEAD_SHA\\`"
-            echo "- SPRT exit code: \\`${{ steps.run_sprt.outputs.exit_code || 'not-run' }}\\`"
+            echo "- Base commit: \`$BASE_SHA\`"
+            echo "- Candidate commit: \`$HEAD_SHA\`"
+            echo "- SPRT exit code: \`${{ steps.run_sprt.outputs.exit_code || 'not-run' }}\`"
             echo '- H1 means evidence supports at least the +5 Elo alternative against this base under this test setup; it does **not** mean 3000 Elo.'
             echo '- The included SPRT script uses a W/D/L-based approximate LLR, not a pentanomial likelihood model. Treat small Elo estimates cautiously.'
             echo ''
