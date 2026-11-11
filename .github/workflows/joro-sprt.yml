@@ -124,7 +124,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd "$RUNNER_TEMP/joro-base" && chmod +x build.sh && ./build.sh)
+          BASE_DIR="$RUNNER_TEMP/joro-base"
+          if [[ ! -f "$BASE_DIR/build.sh" ]]; then
+            echo "::error::Tsy misy build.sh ao amin’ny base ($BASE_SHA). Misafidiana base misy ny project feno (build.sh, src/, tools/)."
+            ls -la "$BASE_DIR"
+            exit 1
+          fi
+          if [[ ! -f build.sh ]]; then
+            echo '::error::Tsy misy build.sh ao amin’ny racine an’ny candidate. Hamarino fa ao amin’ny racine ny build.sh, src/, tools/ (tsy ao anaty sampana joro/).'
+            ls -la
+            exit 1
+          fi
+          (cd "$BASE_DIR" && chmod +x build.sh && ./build.sh)
           chmod +x build.sh
           ./build.sh
 
