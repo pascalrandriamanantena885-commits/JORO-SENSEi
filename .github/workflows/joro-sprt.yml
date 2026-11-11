@@ -101,6 +101,35 @@ jobs:
           echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
           echo "Base: $BASE_SHA | Candidate: $HEAD_SHA"
 
+      - name: Extract project from .tgz (candidate and base)
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract() {
+            local dir="$1" arc tmp bs
+            if [[ -f "$dir/build.sh" ]]; then
+              echo "build.sh efa ao amin’ny $dir (tsy mila extract)"
+              return 0
+            fi
+            arc=$(find "$dir" -maxdepth 1 \( -name '*.tgz' -o -name '*.tar.gz' \) | sort | head -1)
+            if [[ -z "$arc" ]]; then
+              echo "::error::Tsy hita ny rakitra .tgz ao amin’ny $dir"
+              ls -la "$dir"
+              return 1
+            fi
+            echo "Extract: $arc"
+            tmp=$(mktemp -d)
+            tar -xzf "$arc" -C "$tmp"
+            bs=$(find "$tmp" -maxdepth 3 -name build.sh | head -1)
+            if [[ -z "$bs" ]]; then
+              echo "::error::Tsy misy build.sh ao anatin’ny $arc"
+              return 1
+            fi
+            cp -a "$(dirname "$bs")/." "$dir/"
+          }
+          extract "$GITHUB_WORKSPACE"
+          extract "$RUNNER_TEMP/joro-base"
+
       - name: Set up Java 17 and Python
         uses: actions/setup-java@v4
         with:
@@ -126,12 +155,12 @@ jobs:
           set -euo pipefail
           BASE_DIR="$RUNNER_TEMP/joro-base"
           if [[ ! -f "$BASE_DIR/build.sh" ]]; then
-            echo "::error::Tsy misy build.sh ao amin’ny base ($BASE_SHA). Misafidiana base misy ny project feno (build.sh, src/, tools/)."
+            echo "::error::Tsy misy build.sh ao amin’ny base ($BASE_SHA). Misafidiana base misy ny rakitra .tgz."
             ls -la "$BASE_DIR"
             exit 1
           fi
           if [[ ! -f build.sh ]]; then
-            echo '::error::Tsy misy build.sh ao amin’ny racine an’ny candidate. Hamarino fa ao amin’ny racine ny build.sh, src/, tools/ (tsy ao anaty sampana joro/).'
+            echo '::error::Tsy misy build.sh ao amin’ny racine an’ny candidate. Hamarino ny rakitra .tgz ao amin’ny candidate.'
             ls -la
             exit 1
           fi
