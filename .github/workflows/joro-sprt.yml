@@ -92,8 +92,8 @@ jobs:
               echo '::warning::Mitovy ny base sy candidate, ka ampiasaina ny HEAD~1 ho base.'
               BASE_SHA=$(git rev-parse 'HEAD~1^{commit}')
             else
-              echo '::error::Mitovy ny base sy candidate ary tsy misy commit taloha.'
-              exit 1
+              echo '::warning::Commit iray ihany ao amin’ny repo: base = candidate (SMOKE TEST). Hamarinina fotsiny ny pipeline; azo antoka fa ~0 Elo ny valiny.'
+              echo "SMOKE=1" >> "$GITHUB_ENV"
             fi
           fi
           git worktree add --detach "$RUNNER_TEMP/joro-base" "$BASE_SHA"
@@ -217,6 +217,9 @@ jobs:
             echo "- Base commit: \`$BASE_SHA\`"
             echo "- Candidate commit: \`$HEAD_SHA\`"
             echo "- SPRT exit code: \`${{ steps.run_sprt.outputs.exit_code || 'not-run' }}\`"
+            if [[ "${SMOKE:-0}" == "1" ]]; then
+              echo '- **SMOKE TEST:** base et candidate mitovy (commit iray ihany). Fanamarinana pipeline ihany izany; tsy mampiseho fanatsarana.'
+            fi
             echo '- H1 means evidence supports at least the +5 Elo alternative against this base under this test setup; it does **not** mean 3000 Elo.'
             echo '- The included SPRT script uses a W/D/L-based approximate LLR, not a pentanomial likelihood model. Treat small Elo estimates cautiously.'
             echo ''
