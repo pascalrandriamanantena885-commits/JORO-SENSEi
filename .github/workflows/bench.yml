@@ -1,0 +1,52 @@
+name: Bench (nps sy depth)
+on:
+  workflow_dispatch:
+    inputs:
+      base_tgz:
+        description: "Dikan-teny taloha (.tgz). Foana = faharoa farany araka ny sort -V"
+        required: false
+        default: ""
+      runs:
+        description: "Isan'ny run mifandimby"
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract base + new
+        env:
+          BASE_IN: ${{ github.event.inputs.base_tgz }}
+        run: |
+          set -e
+          LIST=$(ls project*.tgz 2>/dev/null | sort -V)
+          NEW=$(echo "$LIST" | tail -1)
+          if [ -n "$BASE_IN" ]; then BASE="$BASE_IN"; else BASE=$(echo "$LIST" | tail -2 | head -1); fi
+          if [ -z "$NEW" ] || [ -z "$BASE" ] || [ "$NEW" = "$BASE" ]; then
+            echo "::error::Mila project*.tgz roa samy hafa (taloha sy vaovao)"; ls -la; exit 1
+          fi
+          echo "BASE=$BASE  NEW=$NEW"
+          mkdir base new
+          tar xzf "$BASE" --strip-components=1 -C base
+          tar xzf "$NEW" --strip-components=1 --strip-components=1 -C new
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+
+      - name: Compile base + new
+        run: |
+          set -e
+          mkdir cls_base cls_new
+          javac -d cls_base base/src/*.java base/tools/Bench.java
+          javac -d cls_new  new/src/*.java  new/tools/Bench.java
+
+      - name: Bench taloha vs vaovao (mifandimby)
+        run: |
+          python3 new/tools/benchcmp.py cls_base cls_new --runs "${{ github.event.inputs.runs || '5' }}"
+          echo "nproc=$(nproc)" >> "$GITHUB_STEP_SUMMARY"
