@@ -1,0 +1,86 @@
+name: Calibrate own engine
+on:
+  workflow_dispatch:
+    inputs:
+      levels:
+        description: "UCI_Elo (JSON array). Mode profile: Elo bot 1000-2500"
+        default: "[1000,1300,1500,1600,1900,2000,2300,2450]"
+      profile:
+        description: "true = JORO milalao araka ny OwnBot.profile (Elo bot 1000-2500, fotoana araka ny app); false = hery feno"
+        default: "true"
+      games:
+        description: "Lalao ambony indrindra isaky ny ambaratonga"
+        default: "40"
+      movetime:
+        description: "ms isaky ny hetsika"
+        default: "1500"
+      opts:
+        description: "Safidy UCI an'i JORO (ohatra Eval2=1,Eval3=1). Foana = default"
+        default: ""
+      target_ci:
+        description: "Janona raha ±Elo (95%) <= ity"
+        default: "45"
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        level: ${{ fromJSON(inputs.levels) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract project archive
+        run: |
+          F=$(ls project*.tgz 2>/dev/null | sort -V | tail -1)
+          if [ -z "$F" ]; then echo "::error::Tsy hita ny project*.tgz"; ls -la; exit 1; fi
+          echo "Mampiasa $F"
+          tar xzf "$F"
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+
+      - name: Install Stockfish + python-chess
+        run: sudo apt-get update && sudo apt-get install -y stockfish && pip install chess
+
+      - name: Compile own engine
+        run: mkdir cls && javac -d cls src/*.java tools/OwnUci.java
+
+      - name: Calibrate vs Stockfish UCI_Elo=${{ matrix.level }}
+        env:
+          OPTS: ${{ inputs.opts }}
+        run: |
+          PROF=""; [ "${{ inputs.profile }}" = "true" ] && PROF="--profile"
+          python3 tools/calibrate.py cls --levels ${{ matrix.level }} $PROF \
+            --games ${{ inputs.games }} --movetime ${{ inputs.movetime }} \
+            --target-ci ${{ inputs.target_ci }} --workers 2 \
+            --opts "$OPTS" --out calib-${{ matrix.level }}.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: calib-${{ matrix.level }}
+          path: calib-${{ matrix.level }}.json
+
+  summary:
+    needs: calibrate
+    if: always() && needs.calibrate.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract project archive
+        run: |
+          F=$(ls project*.tgz 2>/dev/null | sort -V | tail -1)
+          tar xzf "$F"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: calib-*
+          path: results
+          merge-multiple: true
+      - name: Aggregate
+        run: python3 tools/calibrate.py --aggregate results
