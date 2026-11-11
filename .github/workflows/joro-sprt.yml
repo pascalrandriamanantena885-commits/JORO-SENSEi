@@ -1,0 +1,200 @@
+name: JORO HCE — SPRT
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Branch/tag/commit hampitahana (matetika main)'
+        required: true
+        default: 'main'
+        type: string
+      mode:
+        description: 'Haben’ny fitsapana'
+        required: true
+        default: 'standard'
+        type: choice
+        options:
+          - quick
+          - standard
+          - deep
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: joro-sprt-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sprt:
+    name: Compare candidate with base (HCE only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout candidate and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select comparison settings
+        id: cfg
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BASE: ${{ inputs.base_ref }}
+          INPUT_MODE: ${{ inputs.mode }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            BASE="$PR_BASE"
+          else
+            BASE="$INPUT_BASE"
+          fi
+          MODE="${INPUT_MODE:-standard}"
+          case "$MODE" in
+            quick)    GAMES=100;  MOVETIME=100; TIMEOUT=45 ;;
+            standard) GAMES=400;  MOVETIME=100; TIMEOUT=180 ;;
+            deep)     GAMES=1200; MOVETIME=100; TIMEOUT=350 ;;
+            *) echo "Unknown mode: $MODE"; exit 2 ;;
+          esac
+          echo "base_ref=$BASE" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "games=$GAMES" >> "$GITHUB_OUTPUT"
+          echo "movetime=$MOVETIME" >> "$GITHUB_OUTPUT"
+          echo "timeout=$TIMEOUT" >> "$GITHUB_OUTPUT"
+          {
+            echo '### JORO SPRT configuration'
+            echo "- Mode: **$MODE**"
+            echo "- Base: \\`$BASE\\`"
+            echo "- Maximum games: **$GAMES**"
+            echo "- Movetime: **$MOVETIME ms per move**"
+            echo '- Hypotheses: H0 = 0 Elo; H1 = +5 Elo; alpha = beta = 0.05'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare base revision
+        shell: bash
+        env:
+          BASE_REF: ${{ steps.cfg.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1; then
+            BASE_SHA=$(git rev-parse "$BASE_REF^{commit}")
+          else
+            git fetch --no-tags origin "$BASE_REF"
+            BASE_SHA=$(git rev-parse 'FETCH_HEAD^{commit}')
+          fi
+          HEAD_SHA=$(git rev-parse HEAD)
+          if [[ "$BASE_SHA" == "$HEAD_SHA" ]]; then
+            echo '::error::Mitovy amin’ny candidate ny base. Misafidiana base taloha (ohatra main).' 
+            exit 1
+          fi
+          git worktree add --detach "$RUNNER_TEMP/joro-base" "$BASE_SHA"
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "Base: $BASE_SHA | Candidate: $HEAD_SHA"
+
+      - name: Set up Java 17 and Python
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install python-chess
+        run: python -m pip install --upgrade pip python-chess
+
+      - name: Verify candidate is HCE-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RniE 'NNUE|\.nnue|network[-_ ]weights' src; then
+            echo '::error::Misy soritra NNUE/network weights ao amin’ny source. HCE-only gate failed.'
+            exit 1
+          fi
+          echo 'HCE-only source scan: PASS' | tee hce-check.txt
+
+      - name: Build base and candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd "$RUNNER_TEMP/joro-base" && chmod +x build.sh && ./build.sh)
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Candidate correctness gates (Perft + symmetry + UCI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -cp build/cls mg.chess.offline.own.Perft | tee perft.txt
+          grep -q 'PERFT_SUMMARY PASS nodes=16989881' perft.txt
+          java -cp build/cls mg.chess.offline.own.SymTest | tee symmetry.txt
+          grep -q 'SYMMETRY PASS' symmetry.txt
+          printf 'uci\nisready\nquit\n' | java -cp build/cls mg.chess.offline.own.OwnUci | tee uci.txt
+          grep -q 'uciok' uci.txt
+          grep -q 'readyok' uci.txt
+
+      - name: Run SPRT (new candidate vs base)
+        id: run_sprt
+        shell: bash
+        env:
+          GAMES: ${{ steps.cfg.outputs.games }}
+          MOVETIME: ${{ steps.cfg.outputs.movetime }}
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          set +e
+          python tools/sprt.py \
+            "$RUNNER_TEMP/joro-base/build/cls" build/cls \
+            --games "$GAMES" \
+            --movetime "$MOVETIME" \
+            --elo0 0 --elo1 5 \
+            --alpha 0.05 --beta 0.05 \
+            --workers 2 \
+            --dump results/games.txt 2>&1 | tee results/sprt.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+          case "$CODE" in
+            0) echo 'SPRT result: H1 — candidate passed (+5 Elo hypothesis).' ;;
+            1) echo 'SPRT result: H0 — tsy nahazo porofo ampy hanohanana ny +5 Elo.' ;; 
+            2) echo 'SPRT result: INCONCLUSIVE — maximum game count reached before a boundary.' ;;
+            *) echo "::error::SPRT failed with exit code $CODE"; exit "$CODE" ;;
+          esac
+
+      - name: Create test report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '### JORO HCE SPRT report'
+            echo "- Base commit: \\`$BASE_SHA\\`"
+            echo "- Candidate commit: \\`$HEAD_SHA\\`"
+            echo "- SPRT exit code: \\`${{ steps.run_sprt.outputs.exit_code || 'not-run' }}\\`"
+            echo '- H1 means evidence supports at least the +5 Elo alternative against this base under this test setup; it does **not** mean 3000 Elo.'
+            echo '- The included SPRT script uses a W/D/L-based approximate LLR, not a pentanomial likelihood model. Treat small Elo estimates cautiously.'
+            echo ''
+            echo '#### Perft'
+            echo '```text'
+            cat perft.txt 2>/dev/null || true
+            echo '```'
+            echo '#### SPRT log'
+            echo '```text'
+            tail -80 results/sprt.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SPRT results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: joro-sprt-${{ steps.cfg.outputs.mode }}-${{ github.run_number }}
+          path: |
+            hce-check.txt
+            perft.txt
+            symmetry.txt
+            uci.txt
+            results/
+          if-no-files-found: warn
+          retention-days: 30
