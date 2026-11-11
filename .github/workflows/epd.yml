@@ -1,0 +1,150 @@
+name: EPD tactique (WAC / ERET) - vaovao vs taloha
+on:
+  workflow_dispatch:
+    inputs:
+      base_tgz:
+        description: "Taloha (.tgz). Foana = faharoa farany araka ny sort -V"
+        required: false
+        default: ""
+      files:
+        description: "Rakitra EPD (sarahina ',' ; ohatra tests/wac.epd,tests/eret.epd). Foana = tests/*.epd rehetra afa-tsy smoke"
+        required: false
+        default: ""
+      movetime:
+        description: "ms isaky ny toerana"
+        default: "1000"
+      depth:
+        description: "Depth faratampony (64 = fotoana ihany no mamaritra)"
+        default: "64"
+      shards:
+        description: "Isan'ny job miaraka isaky ny taloha/vaovao (1-8)"
+        default: "4"
+      opts_base:
+        description: "Safidy an'ny taloha (ohatra HashBits=19)"
+        required: false
+        default: ""
+      opts_new:
+        description: "Safidy an'ny vaovao (ohatra SacVerify=1 KingPressure=30)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.s.outputs.shards }}
+      n: ${{ steps.s.outputs.n }}
+    steps:
+      - id: s
+        env:
+          N: ${{ github.event.inputs.shards }}
+        run: |
+          N=${N:-4}
+          case "$N" in ''|*[!0-9]*) N=4;; esac
+          [ "$N" -ge 1 ] || N=1; [ "$N" -le 8 ] || N=8
+          echo "shards=[$(seq -s, 0 $((N-1)))]" >> "$GITHUB_OUTPUT"
+          echo "n=$N" >> "$GITHUB_OUTPUT"
+
+  epd:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, new]
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract base + new
+        env:
+          BASE_IN: ${{ github.event.inputs.base_tgz }}
+        run: |
+          set -e
+          LIST=$(ls project*.tgz 2>/dev/null | sort -V)
+          NEW=$(echo "$LIST" | tail -1)
+          if [ -n "$BASE_IN" ]; then BASE="$BASE_IN"; else BASE=$(echo "$LIST" | tail -2 | head -1); fi
+          if [ -z "$NEW" ] || [ -z "$BASE" ] || [ "$NEW" = "$BASE" ]; then
+            echo "::error::Mila project*.tgz roa samy hafa (taloha sy vaovao)"; ls -la; exit 1
+          fi
+          echo "BASE=$BASE  NEW=$NEW"
+          mkdir base new
+          tar xzf "$BASE" --strip-components=1 -C base
+          tar xzf "$NEW" --strip-components=1 -C new
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+
+      - name: Compile (EpdTest avy amin'ny vaovao, ampiasaina ho an'ny roa tonta)
+        run: |
+          set -e
+          D=${{ matrix.side }}
+          mkdir cls
+          javac -d cls "$D"/src/*.java new/tools/EpdTest.java
+
+      - name: Hitady ny rakitra EPD
+        id: f
+        env:
+          FILES_IN: ${{ github.event.inputs.files }}
+        run: |
+          set -e
+          resolve() { if [ -f "$1" ]; then echo "$1"; elif [ -f "new/$1" ]; then echo "new/$1"; else echo ""; fi; }
+          OUT=""
+          if [ -n "$FILES_IN" ]; then
+            for f in $(echo "$FILES_IN" | tr ',' ' '); do
+              r=$(resolve "$f"); [ -n "$r" ] || { echo "::error::Tsy hita ny $f (tsy ao amin'ny repo na ny tgz vaovao)"; exit 1; }
+              OUT="$OUT,$r"
+            done
+          else
+            for f in $(ls tests/*.epd new/tests/*.epd 2>/dev/null | grep -v smoke | awk -F/ '{print $NF" "$0}' | sort -u -k1,1 | cut -d' ' -f2); do OUT="$OUT,$f"; done
+            if [ -z "$OUT" ]; then
+              echo "::warning::Tsy misy EPD tena izy (wac/eret); smoke.epd ihany no alefa"
+              r=$(resolve tests/smoke.epd); [ -n "$r" ] || { echo "::error::Tsy misy EPD mihitsy"; exit 1; }
+              OUT=",$r"
+            fi
+          fi
+          OUT=${OUT#,}
+          echo "Rakitra: $OUT"
+          echo "files=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: EPD
+        run: |
+          set +e
+          if [ "${{ matrix.side }}" = "base" ]; then OPTS="${{ github.event.inputs.opts_base }}"; else OPTS="${{ github.event.inputs.opts_new }}"; fi
+          java -cp cls mg.chess.offline.own.EpdTest "${{ steps.f.outputs.files }}" \
+            movetime="${{ github.event.inputs.movetime || '1000' }}" depth="${{ github.event.inputs.depth || '64' }}" \
+            shard=${{ matrix.shard }} shards=${{ needs.plan.outputs.n }} \
+            out=epd-${{ matrix.side }}-${{ matrix.shard }}.txt $OPTS | tee epd-run.txt
+          rc=${PIPESTATUS[0]}
+          { echo "#### ${{ matrix.side }} shard ${{ matrix.shard }}"; echo '```'; grep -E 'EPD_FILE|EPD_SUMMARY' epd-run.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: epd-${{ matrix.side }}-${{ matrix.shard }}
+          path: epd-${{ matrix.side }}-${{ matrix.shard }}.txt
+          if-no-files-found: warn
+
+  compare:
+    needs: epd
+    if: always() && needs.epd.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract new
+        run: |
+          NEW=$(ls project*.tgz | sort -V | tail -1)
+          mkdir new && tar xzf "$NEW" --strip-components=1 -C new
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: epd-*
+          path: res
+          merge-multiple: true
+      - name: Fampitahana
+        run: python3 new/tools/epdcmp.py res
