@@ -1,4 +1,4 @@
-name: JORO HCE — SPRT (matrix)
+name: JORO HCE — SPRT Matrix
 
 on:
   workflow_dispatch:
@@ -9,26 +9,38 @@ on:
         default: 'main'
         type: string
       mode:
-        description: 'Haben’ny fitsapana (isa-job x lalao isaky ny job)'
+        description: 'Haben’ny fitsapana (isa-job × lalao/job)'
         required: true
         default: 'standard'
         type: choice
-        options:
-          - quick      # 5 x 20 = 100 lalao
-          - standard   # 8 x 50 = 400 lalao
-          - deep       # 12 x 100 = 1200 lalao
+        options: [quick, standard, deep]
       elo1:
-        description: 'H1 (Elo). 5 = henjana (mila lalao be), 10 = haingana kokoa'
-        required: false
+        description: 'H1 Elo kendrena (ohatra 5 na 10)'
+        required: true
         default: '5'
         type: string
       start_game:
-        description: 'Hitohy: laharana lalao voalohany (isa even; jereo "Hitohy" ao amin’ny summary teo aloha)'
-        required: false
+        description: 'Tohiny: laharana lalao voalohany (even; 0 raha vaovao)'
+        required: true
         default: '0'
         type: string
       prior:
-        description: 'Hitohy: W,D,L teo aloha (ohatra 120,160,110)'
+        description: 'Tohiny: W,D,L teo aloha (ohatra 120,160,110); avela foana raha vaovao'
+        required: false
+        default: ''
+        type: string
+      prior_base_sha:
+        description: 'Base SHA an’ilay run teo aloha (ilaina raha prior no ampiasaina)'
+        required: false
+        default: ''
+        type: string
+      prior_head_sha:
+        description: 'Candidate SHA an’ilay run teo aloha (ilaina raha prior no ampiasaina)'
+        required: false
+        default: ''
+        type: string
+      prior_elo1:
+        description: 'H1 Elo nampiasaina tamin’ilay run teo aloha'
         required: false
         default: ''
         type: string
@@ -39,15 +51,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: joro-sprt-${{ github.ref }}
+  group: joro-sprt-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  # ------------------------------------------------------------------
-  # 1) Build base + candidate indray mandeha ihany, gates, ary mitahiry binaire
-  # ------------------------------------------------------------------
   build:
-    name: Build + gates (HCE only)
+    name: Build + correctness gates (HCE only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -58,8 +71,8 @@ jobs:
       shards: ${{ steps.cfg.outputs.shards }}
       shard_count: ${{ steps.cfg.outputs.shard_count }}
       games: ${{ steps.cfg.outputs.games }}
-      elo1: ${{ steps.cfg.outputs.elo1 }}
       start: ${{ steps.cfg.outputs.start }}
+      elo1: ${{ steps.cfg.outputs.elo1 }}
       prior: ${{ steps.cfg.outputs.prior }}
     steps:
       - name: Checkout candidate and history
@@ -67,9 +80,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Select comparison settings
+      - name: Select and validate settings
         id: cfg
-        shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_BASE: ${{ inputs.base_ref }}
@@ -77,121 +89,115 @@ jobs:
           INPUT_ELO1: ${{ inputs.elo1 }}
           INPUT_START: ${{ inputs.start_game }}
           INPUT_PRIOR: ${{ inputs.prior }}
+          INPUT_PRIOR_BASE: ${{ inputs.prior_base_sha }}
+          INPUT_PRIOR_HEAD: ${{ inputs.prior_head_sha }}
+          INPUT_PRIOR_ELO1: ${{ inputs.prior_elo1 }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            BASE="$PR_BASE"
-          else
-            BASE="$INPUT_BASE"
-          fi
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then BASE="$PR_BASE"; else BASE="${INPUT_BASE:-main}"; fi
           MODE="${INPUT_MODE:-standard}"
           ELO1="${INPUT_ELO1:-5}"
           START="${INPUT_START:-0}"
           PRIOR="${INPUT_PRIOR:-}"
+          PRIOR_BASE="${INPUT_PRIOR_BASE:-}"
+          PRIOR_HEAD="${INPUT_PRIOR_HEAD:-}"
+          PRIOR_ELO1="${INPUT_PRIOR_ELO1:-}"
 
-          if ! [[ "$ELO1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-            echo '::error::elo1 tokony ho isa (ohatra 5 na 10).'; exit 2
-          fi
+          python3 - "$ELO1" <<'PY'
+          import math, sys
+          try: x = float(sys.argv[1])
+          except ValueError: raise SystemExit('::error::elo1 tsy isa manankery.')
+          if not math.isfinite(x) or x <= 0: raise SystemExit('::error::elo1 tokony ho isa finite > 0.')
+          PY
           if ! [[ "$START" =~ ^[0-9]+$ ]] || (( START % 2 != 0 )); then
-            echo '::error::start_game tokony ho isa even (0, 2, 4...).'; exit 2
+            echo '::error::start_game tokony ho isa even (0,2,4...).'; exit 2
           fi
-          if [[ -n "$PRIOR" ]] && ! [[ "$PRIOR" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]; then
-            echo '::error::prior tokony ho W,D,L (ohatra 120,160,110).'; exit 2
+          if [[ -n "$PRIOR" ]]; then
+            if ! [[ "$PRIOR" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]; then echo '::error::prior tokony ho W,D,L.'; exit 2; fi
+            IFS=, read -r PW PD PL <<< "$PRIOR"
+            if (( PW + PD + PL == 0 || PW + PD + PL != START )); then
+              echo '::error::W+D+L teo aloha dia tsy maintsy mitovy amin’ny start_game.'; exit 2
+            fi
+            if [[ -z "$PRIOR_BASE" || -z "$PRIOR_HEAD" || -z "$PRIOR_ELO1" ]]; then
+              echo '::error::Fenoy prior_base_sha, prior_head_sha ary prior_elo1 raha mampiasa prior.'; exit 2
+            fi
+            python3 - "$ELO1" "$PRIOR_ELO1" <<'PY'
+          import math, sys
+          try: a, b = map(float, sys.argv[1:])
+          except ValueError: raise SystemExit('::error::prior_elo1 tsy isa manankery.')
+          if not math.isfinite(b) or abs(a-b) > 1e-9: raise SystemExit('::error::Tsy mitovy ny prior_elo1 sy elo1 ankehitriny.')
+          PY
+          elif (( START != 0 )); then
+            echo '::error::Raha tsy misy prior dia start_game tsy maintsy 0.'; exit 2
           fi
 
-          # Isa-job x lalao isaky ny job (lalao isaky ny job tsy maintsy even)
           case "$MODE" in
-            quick)    SHARDS=5;  GAMES=20  ;;
-            standard) SHARDS=8;  GAMES=50  ;;
-            deep)     SHARDS=12; GAMES=100 ;;
-            *) echo "Unknown mode: $MODE"; exit 2 ;;
+            quick) SHARDS=5; GAMES=20 ;;
+            standard) SHARDS=8; GAMES=50 ;;
+            deep) SHARDS=12; GAMES=100 ;;
+            *) echo "::error::Mode tsy fantatra: $MODE"; exit 2 ;;
           esac
           SHARD_LIST=$(python3 -c 'import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))' "$SHARDS")
-          TOTAL=$(( SHARDS * GAMES ))
-
           {
-            echo "base_ref=$BASE"
-            echo "mode=$MODE"
-            echo "shards=$SHARD_LIST"
-            echo "shard_count=$SHARDS"
-            echo "games=$GAMES"
-            echo "elo1=$ELO1"
-            echo "start=$START"
-            echo "prior=$PRIOR"
+            echo "base_ref=$BASE"; echo "mode=$MODE"; echo "shards=$SHARD_LIST"
+            echo "shard_count=$SHARDS"; echo "games=$GAMES"; echo "start=$START"
+            echo "elo1=$ELO1"; echo "prior=$PRIOR"
+            echo "prior_base_sha=$PRIOR_BASE"; echo "prior_head_sha=$PRIOR_HEAD"; echo "prior_elo1=$PRIOR_ELO1"
           } >> "$GITHUB_OUTPUT"
-
           {
-            echo '### JORO SPRT configuration (matrix)'
-            echo "- Mode: **$MODE** — $SHARDS jobs x $GAMES lalao = **$TOTAL lalao**"
-            echo "- Base: \`$BASE\`"
-            echo '- Movetime: **100 ms per move**'
-            echo "- Hypotheses: H0 = 0 Elo; H1 = +$ELO1 Elo; alpha = beta = 0.05"
-            echo "- Lalao voalohany: $START"
+            echo '### JORO HCE SPRT Matrix — configuration'
+            echo "- Mode: **$MODE** — $SHARDS shards × $GAMES lalao = **$((SHARDS * GAMES)) lalao**"
+            echo "- Base ref: \`$BASE\`"
+            echo "- Hypotheses: H0=0 Elo; H1=+$ELO1 Elo; alpha=beta=0.05"
+            echo '- Movetime: **100 ms/move**; workers/shard: **2**'
+            echo "- Start game: **$START**"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Prepare base revision
         id: base
-        shell: bash
         env:
           BASE_REF: ${{ steps.cfg.outputs.base_ref }}
+          PRIOR: ${{ steps.cfg.outputs.prior }}
+          PRIOR_BASE: ${{ inputs.prior_base_sha }}
+          PRIOR_HEAD: ${{ inputs.prior_head_sha }}
         run: |
           set -euo pipefail
-          SMOKE=0
-          if git rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1; then
-            BASE_SHA=$(git rev-parse "$BASE_REF^{commit}")
+          if git rev-parse --verify "${BASE_REF}^{commit}" >/dev/null 2>&1; then
+            BASE_SHA=$(git rev-parse "${BASE_REF}^{commit}")
           else
             git fetch --no-tags origin "$BASE_REF"
             BASE_SHA=$(git rev-parse 'FETCH_HEAD^{commit}')
           fi
           HEAD_SHA=$(git rev-parse HEAD)
+          SMOKE=0
           if [[ "$BASE_SHA" == "$HEAD_SHA" ]]; then
-            if git rev-parse --verify 'HEAD~1^{commit}' >/dev/null 2>&1; then
-              echo '::warning::Mitovy ny base sy candidate, ka ampiasaina ny HEAD~1 ho base.'
-              BASE_SHA=$(git rev-parse 'HEAD~1^{commit}')
-            else
-              echo '::warning::Commit iray ihany ao amin’ny repo: base = candidate (SMOKE TEST). Hamarinina fotsiny ny pipeline; azo antoka fa ~0 Elo ny valiny.'
-              SMOKE=1
-            fi
+            echo '::error::Mitovy ny base sy candidate. Alefaso avy amin’ny branch candidate izay manana commit hafa noho ny base_ref (matetika main).'; exit 2
+          fi
+          if [[ -n "$PRIOR" && ( "$PRIOR_BASE" != "$BASE_SHA" || "$PRIOR_HEAD" != "$HEAD_SHA" ) ]]; then
+            echo '::error::Tsy mitovy ny base/head SHA amin’ilay run teo aloha; aza afangaro ny vokatra.'; exit 2
           fi
           git worktree add --detach "$RUNNER_TEMP/joro-base" "$BASE_SHA"
-          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
-          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
-          {
-            echo "base_sha=$BASE_SHA"
-            echo "head_sha=$HEAD_SHA"
-            echo "smoke=$SMOKE"
-          } >> "$GITHUB_OUTPUT"
-          echo "Base: $BASE_SHA | Candidate: $HEAD_SHA | smoke=$SMOKE"
+          { echo "base_sha=$BASE_SHA"; echo "head_sha=$HEAD_SHA"; echo "smoke=$SMOKE"; } >> "$GITHUB_OUTPUT"
 
-      - name: Extract project from .tgz (candidate and base)
-        shell: bash
+      - name: Extract project from .tgz when needed
         run: |
           set -euo pipefail
-          extract() {
+          extract_project() {
             local dir="$1" arc tmp bs
-            if [[ -f "$dir/build.sh" ]]; then
-              echo "build.sh efa ao amin’ny $dir (tsy mila extract)"
-              return 0
+            if [[ -f "$dir/build.sh" ]]; then return 0; fi
+            mapfile -t archives < <(find "$dir" -maxdepth 1 -type f \( -name '*.tgz' -o -name '*.tar.gz' \) | sort)
+            if (( ${#archives[@]} != 1 )); then
+              echo "::error::Ao amin’ny $dir dia mila build.sh mivantana na .tgz tokana."; ls -la "$dir"; return 1
             fi
-            arc=$(find "$dir" -maxdepth 1 \( -name '*.tgz' -o -name '*.tar.gz' \) | sort | head -1)
-            if [[ -z "$arc" ]]; then
-              echo "::error::Tsy hita ny rakitra .tgz ao amin’ny $dir"
-              ls -la "$dir"
-              return 1
-            fi
-            echo "Extract: $arc"
-            tmp=$(mktemp -d)
-            tar -xzf "$arc" -C "$tmp"
-            bs=$(find "$tmp" -maxdepth 3 -name build.sh | head -1)
-            if [[ -z "$bs" ]]; then
-              echo "::error::Tsy misy build.sh ao anatin’ny $arc"
-              return 1
-            fi
+            arc="${archives[0]}"; tmp=$(mktemp -d); tar -xzf "$arc" -C "$tmp"
+            bs=$(find "$tmp" -maxdepth 4 -type f -name build.sh -print -quit)
+            if [[ -z "$bs" ]]; then echo "::error::Tsy misy build.sh ao amin’ny $arc"; return 1; fi
             cp -a "$(dirname "$bs")/." "$dir/"
+            test -f "$dir/build.sh"
           }
-          extract "$GITHUB_WORKSPACE"
-          extract "$RUNNER_TEMP/joro-base"
+          extract_project "$GITHUB_WORKSPACE"
+          extract_project "$RUNNER_TEMP/joro-base"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -199,37 +205,29 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Verify candidate is HCE-only
-        shell: bash
+      - name: Verify base and candidate are HCE-only
         run: |
           set -euo pipefail
-          if grep -RniE 'NNUE|\.nnue|network[-_ ]weights' src; then
-            echo '::error::Misy soritra NNUE/network weights ao amin’ny source. HCE-only gate failed.'
-            exit 1
-          fi
-          echo 'HCE-only source scan: PASS' | tee hce-check.txt
+          : > hce-check.txt
+          for tree in "$RUNNER_TEMP/joro-base" "$GITHUB_WORKSPACE"; do
+            test -d "$tree/src" || { echo "::error::Tsy hita ny src ao amin’ny $tree"; exit 1; }
+            if grep -RniE 'NNUE|\.nnue|network[-_ ]weights' "$tree/src"; then
+              echo "::error::Misy soritra NNUE/network weights ao amin’ny $tree/src"; exit 1
+            fi
+            if find "$tree" -type f \( -iname '*.nnue' -o -iname '*nnue*' -o -iname '*network*weights*' \) -print -quit | grep -q .; then
+              echo "::error::Misy rakitra NNUE/network weights ao amin’ny $tree"; exit 1
+            fi
+            echo "HCE-only scan PASS: $tree" | tee -a hce-check.txt
+          done
 
       - name: Build base and candidate
-        shell: bash
         run: |
           set -euo pipefail
-          BASE_DIR="$RUNNER_TEMP/joro-base"
-          if [[ ! -f "$BASE_DIR/build.sh" ]]; then
-            echo "::error::Tsy misy build.sh ao amin’ny base ($BASE_SHA). Misafidiana base misy ny rakitra .tgz."
-            ls -la "$BASE_DIR"
-            exit 1
-          fi
-          if [[ ! -f build.sh ]]; then
-            echo '::error::Tsy misy build.sh ao amin’ny racine an’ny candidate. Hamarino ny rakitra .tgz ao amin’ny candidate.'
-            ls -la
-            exit 1
-          fi
-          (cd "$BASE_DIR" && chmod +x build.sh && ./build.sh)
-          chmod +x build.sh
-          ./build.sh
+          (cd "$RUNNER_TEMP/joro-base" && chmod +x build.sh && ./build.sh)
+          chmod +x build.sh && ./build.sh
+          test -d "$RUNNER_TEMP/joro-base/build/cls" && test -d build/cls
 
       - name: Candidate correctness gates (Perft + symmetry + UCI)
-        shell: bash
         run: |
           set -euo pipefail
           java -cp build/cls mg.chess.offline.own.Perft | tee perft.txt
@@ -237,31 +235,29 @@ jobs:
           java -cp build/cls mg.chess.offline.own.SymTest | tee symmetry.txt
           grep -q 'SYMMETRY PASS' symmetry.txt
           printf 'uci\nisready\nquit\n' | java -cp build/cls mg.chess.offline.own.OwnUci | tee uci.txt
-          grep -q 'uciok' uci.txt
-          grep -q 'readyok' uci.txt
+          grep -q 'uciok' uci.txt && grep -q 'readyok' uci.txt
 
-      - name: Stage binaries for the shards
-        shell: bash
+      - name: Stage binaries and SPRT helper
         run: |
           set -euo pipefail
           mkdir -p stage
-          cp -r build/cls stage/cand_cls
-          cp -r "$RUNNER_TEMP/joro-base/build/cls" stage/base_cls
+          cp -a build/cls stage/cand_cls
+          cp -a "$RUNNER_TEMP/joro-base/build/cls" stage/base_cls
           cp tools/sprt.py stage/sprt.py
 
-      - name: Upload binaries
+      - name: Upload binaries for matrix jobs
         uses: actions/upload-artifact@v4
         with:
-          name: joro-bin
-          path: stage
+          name: joro-bin-${{ github.run_id }}
+          path: stage/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 2
 
       - name: Upload gate reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: joro-gates-${{ github.run_number }}
+          name: joro-gates-${{ github.run_id }}
           path: |
             hce-check.txt
             perft.txt
@@ -270,23 +266,21 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  # ------------------------------------------------------------------
-  # 2) SPRT miaraka (matrix): job tsirairay mandeha lalao ao anatiny
-  # ------------------------------------------------------------------
   sprt:
     name: SPRT shard ${{ matrix.shard }}
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
+      max-parallel: 12
       matrix:
         shard: ${{ fromJSON(needs.build.outputs.shards) }}
     steps:
-      - name: Download binaries
+      - name: Download compiled engines
         uses: actions/download-artifact@v4
         with:
-          name: joro-bin
+          name: joro-bin-${{ github.run_id }}
           path: stage
 
       - name: Set up Java 17
@@ -296,40 +290,43 @@ jobs:
           java-version: '17'
 
       - name: Install python-chess
-        run: python -m pip install --upgrade pip python-chess
+        run: python -m pip install --disable-pip-version-check python-chess
 
-      - name: Run SPRT shard
-        shell: bash
+      - name: Run fixed-size SPRT shard
         env:
           GAMES: ${{ needs.build.outputs.games }}
           START: ${{ needs.build.outputs.start }}
           SHARD: ${{ matrix.shard }}
           MOVETIME: '100'
+          ELO1: ${{ needs.build.outputs.elo1 }}
+          JAVA_TOOL_OPTIONS: '-Xms32m -Xmx512m -XX:+UseSerialGC'
         run: |
           set -euo pipefail
           mkdir -p results
           FIRST=$(( START + SHARD * GAMES ))
-          echo "Shard $SHARD: lalao $FIRST .. $(( FIRST + GAMES - 1 ))"
+          echo "Shard $SHARD: game IDs $FIRST .. $((FIRST + GAMES - 1))"
           python stage/sprt.py stage/base_cls stage/cand_cls \
-            --first-game "$FIRST" \
-            --games "$GAMES" \
-            --movetime "$MOVETIME" \
-            --workers 2 \
-            --out "results/sprt-$SHARD.json" \
-            --dump "results/games-$SHARD.txt"
+            --first-game "$FIRST" --games "$GAMES" --movetime "$MOVETIME" \
+            --elo0 0 --elo1 "$ELO1" --alpha 0.05 --beta 0.05 --workers 2 \
+            --out "results/sprt-$SHARD.json" --dump "results/games-$SHARD.txt"
+          python3 - "$SHARD" "$FIRST" "$GAMES" "results/sprt-$SHARD.json" <<'PY'
+          import json, sys
+          shard, first, games, path = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+          with open(path, encoding='utf-8') as f: d = json.load(f)
+          if d.get('first') != first or d.get('games') != games or sum(int(d.get(k, -1)) for k in ('w','d','l')) != games:
+              raise SystemExit(f'Shard {shard}: tsy feno na tsy mifanaraka ny JSON: {d}')
+          print(f'Shard {shard} PASS: {games} games; W={d["w"]}, D={d["d"]}, L={d["l"]}')
+          PY
 
       - name: Upload shard result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sprt-shard-${{ matrix.shard }}
+          name: joro-sprt-shard-${{ matrix.shard }}-${{ github.run_id }}
           path: results/
           if-no-files-found: warn
           retention-days: 30
 
-  # ------------------------------------------------------------------
-  # 3) Fitambarana: tambatra ny shard rehetra ary kajy ny LLR
-  # ------------------------------------------------------------------
   summary:
     name: Aggregate SPRT result
     needs: [build, sprt]
@@ -337,53 +334,76 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Download sprt.py
+      - name: Download SPRT helper
         uses: actions/download-artifact@v4
         with:
-          name: joro-bin
+          name: joro-bin-${{ github.run_id }}
           path: stage
 
       - name: Download shard results
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          pattern: sprt-shard-*
+          pattern: joro-sprt-shard-*-${{ github.run_id }}
           path: results
           merge-multiple: true
 
-      - name: Aggregate (LLR)
-        shell: bash
+      - name: Validate all shards and aggregate
         env:
           ELO1: ${{ needs.build.outputs.elo1 }}
           PRIOR: ${{ needs.build.outputs.prior }}
           EXPECTED: ${{ needs.build.outputs.shard_count }}
+          GAMES: ${{ needs.build.outputs.games }}
+          START: ${{ needs.build.outputs.start }}
           MODE: ${{ needs.build.outputs.mode }}
           BASE_SHA: ${{ needs.build.outputs.base_sha }}
           HEAD_SHA: ${{ needs.build.outputs.head_sha }}
           SMOKE: ${{ needs.build.outputs.smoke }}
+          MATRIX_RESULT: ${{ needs.sprt.result }}
         run: |
           set -euo pipefail
-          FOUND=$(find results -name 'sprt-*.json' 2>/dev/null | wc -l)
+          mkdir -p results
+          if ! python3 - "$EXPECTED" "$GAMES" "$START" results <<'PY'
+          import glob, json, os, sys
+          expected, games, start, root = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+          files = glob.glob(os.path.join(root, '**', 'sprt-*.json'), recursive=True)
+          found = {}
+          for path in files:
+              name = os.path.basename(path)
+              try: shard = int(name.removeprefix('sprt-').removesuffix('.json'))
+              except ValueError: continue
+              with open(path, encoding='utf-8') as f: d = json.load(f)
+              if shard in found: raise SystemExit(f'Duplicate shard {shard}')
+              if d.get('first') != start + shard * games or d.get('games') != games:
+                  raise SystemExit(f'Wrong game range: {name}: {d}')
+              if sum(int(d.get(k, -1)) for k in ('w','d','l')) != games:
+                  raise SystemExit(f'Incomplete W/D/L: {name}: {d}')
+              found[shard] = path
+          missing = sorted(set(range(expected)) - set(found))
+          extra = sorted(set(found) - set(range(expected)))
+          print(f'Validated shards: {len(found)}/{expected}; missing={missing}; extra={extra}')
+          if missing or extra or len(found) != expected:
+              raise SystemExit('INCOMPLETE: tsy havoaka ny valin’ny SPRT.')
+          PY
+          then
+            echo '### JORO SPRT: INCOMPLETE — tsy feno na tsy marina ny shard; tsy navoaka ny LLR/Elo.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [[ "$MATRIX_RESULT" != 'success' ]]; then
+            echo '### JORO SPRT: FAILED — nisy shard tsy nahomby; tsy ekena ny vokatra.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           {
-            echo '### JORO HCE SPRT report'
+            echo '### JORO HCE SPRT Matrix report'
             echo "- Mode: **$MODE**"
             echo "- Base commit: \`$BASE_SHA\`"
             echo "- Candidate commit: \`$HEAD_SHA\`"
-            echo "- Shards: $FOUND / $EXPECTED"
-            if [[ "$SMOKE" == "1" ]]; then
-              echo '- **SMOKE TEST:** base et candidate mitovy (commit iray ihany). Fanamarinana pipeline ihany izany; tsy mampiseho fanatsarana.'
-            fi
-            if [[ "$FOUND" != "$EXPECTED" ]]; then
-              echo "- **ANTSOINA:** tsy feno ny shard ($FOUND / $EXPECTED). Diso mety ny vokatra."
-            fi
-            echo '- H1 means evidence supports at least the +Elo alternative against this base under this test setup; it does **not** mean 3000 Elo.'
-            echo '- The SPRT script uses a W/D/L-based approximate LLR, not a pentanomial likelihood model. Treat small Elo estimates cautiously.'
-            echo '- Matrix mode: lalao feno no alefa (tsy misy fijanonana aloha), dia jerena ny LLR amin’ny farany.'
+            echo "- Matrix result: **$MATRIX_RESULT**; shards: **$EXPECTED/$EXPECTED**"
+            if [[ "$SMOKE" == '1' ]]; then echo '- **SMOKE TEST:** commit iray ihany; tsy manaporofo fanatsarana Elo.'; fi
+            echo '- H1/H0 dia mifandraika amin’ny hypothesis sy ny test setup ihany; tsy midika ho 3000 Elo.'
+            echo '- Ny helper dia W/D/L approximate LLR fa tsy pentanomial SPRT; raiso am-pitandremana ny tombana Elo.'
+            echo '- Matrix mamita ny lalao rehetra isaky ny shard, avy eo manambatra W/D/L; tsy misy early-stop global.'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$FOUND" != "$EXPECTED" ]]; then
-            echo "::warning::Tsy feno ny shard ($FOUND / $EXPECTED)."
-          fi
           python stage/sprt.py --aggregate results \
-            --elo0 0 --elo1 "$ELO1" \
-            --alpha 0.05 --beta 0.05 \
-            --label "(base $BASE_SHA)" \
-            --prior "$PRIOR"
+            --elo0 0 --elo1 "$ELO1" --alpha 0.05 --beta 0.05 \
+            --label "base=$BASE_SHA candidate=$HEAD_SHA" --prior "$PRIOR"
